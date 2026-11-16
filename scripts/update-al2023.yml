@@ -1,0 +1,126 @@
+---
+# update-al2023.yml
+# Rolling patch playbook for Amazon Linux 2023.
+#
+# Examples:
+#   ansible-playbook -i inventory.ini update-al2023.yml
+#   ansible-playbook -i inventory.ini update-al2023.yml -e target_release=latest
+#   ansible-playbook -i inventory.ini update-al2023.yml -e security_only=true -e batch_size=1
+#   ansible-playbook -i inventory.ini update-al2023.yml --check     # dry run
+#
+# Example inventory.ini:
+#   [al2023]
+#   web-01 ansible_host=10.0.1.10
+#   web-02 ansible_host=10.0.1.11
+#   [al2023:vars]
+#   ansible_user=ec2-user
+#   ansible_ssh_private_key_file=~/.ssh/lab.pem
+
+- name: Patch Amazon Linux 2023 hosts
+  hosts: al2023
+  become: true
+  gather_facts: true
+  serial: "{{ batch_size | default('25%') }}"
+  max_fail_percentage: 0          # stop the rollout if any host in a batch fails
+
+  vars:
+    # AL2023 locks each host to a release version.
+    #   current -> only updates within the host's locked release
+    #   latest  -> move to the newest AL2023 release
+    #   2023.x.YYYYMMDD -> move to a specific, pinned release
+    target_release: current
+    security_only: false
+    reboot_if_needed: true
+    reboot_timeout: 900
+    min_free_root_mb: 1024
+    health_check_cmd: ""          # e.g. "systemctl is-active nginx"
+
+  pre_tasks:
+    - name: Confirm host is Amazon Linux 2023
+      ansible.builtin.assert:
+        that:
+          - ansible_distribution == "Amazon"
+          - ansible_distribution_major_version == "2023"
+        fail_msg: "{{ inventory_hostname }} is {{ ansible_distribution }} {{ ansible_distribution_version }}, not AL2023"
+
+    - name: Check free space on /
+      ansible.builtin.assert:
+        that:
+          - (ansible_mounts | selectattr('mount', 'equalto', '/') | first).size_available > (min_free_root_mb | int * 1024 * 1024)
+        fail_msg: "Less than {{ min_free_root_mb }} MB free on / — clean up before patching"
+
+    - name: Record current release
+      ansible.builtin.command: rpm -q --qf '%{VERSION}' system-release
+      register: release_before
+      changed_when: false
+
+    - name: Check for newer AL2023 releases
+      ansible.builtin.command: dnf check-release-update
+      register: release_update
+      changed_when: false
+      failed_when: false
+
+    - name: Show release status
+      ansible.builtin.debug:
+        msg:
+          - "Current release: {{ release_before.stdout }}"
+          - "{{ (release_update.stdout + release_update.stderr) | trim | default('No newer release reported', true) }}"
+
+    - name: Ensure dnf plugins (needs-restarting) are installed
+      ansible.builtin.dnf:
+        name: dnf-plugins-core
+        state: present
+
+  tasks:
+    - name: Apply updates
+      ansible.builtin.dnf:
+        name: "*"
+        state: latest
+        security: "{{ security_only | bool }}"
+        releasever: "{{ omit if target_release == 'current' else target_release }}"
+        update_cache: true
+      register: dnf_result
+
+    - name: Check whether a reboot is required
+      ansible.builtin.command: dnf needs-restarting -r
+      register: reboot_check
+      changed_when: false
+      failed_when: reboot_check.rc not in [0, 1]
+      when: not ansible_check_mode
+
+    - name: Reboot host
+      ansible.builtin.reboot:
+        reboot_timeout: "{{ reboot_timeout }}"
+        msg: "Rebooting after AL2023 updates"
+      when:
+        - not ansible_check_mode
+        - reboot_if_needed | bool
+        - reboot_check.rc == 1
+
+    - name: List services needing restart (when not rebooting)
+      ansible.builtin.command: dnf needs-restarting -s
+      register: services_check
+      changed_when: false
+      failed_when: false
+      when:
+        - not ansible_check_mode
+        - not (reboot_if_needed | bool) or reboot_check.rc == 0
+
+  post_tasks:
+    - name: Record release after update
+      ansible.builtin.command: rpm -q --qf '%{VERSION}' system-release
+      register: release_after
+      changed_when: false
+
+    - name: Run health check
+      ansible.builtin.shell: "{{ health_check_cmd }}"
+      changed_when: false
+      when: health_check_cmd | length > 0
+
+    - name: Summary
+      ansible.builtin.debug:
+        msg:
+          - "Release: {{ release_before.stdout }} -> {{ release_after.stdout }}"
+          - "Packages changed: {{ dnf_result.changed }}"
+          - "Reboot needed: {{ (reboot_check.rc | default(0)) == 1 }}"
+          - "Services needing restart: {{ services_check.stdout_lines | default([]) }}"
